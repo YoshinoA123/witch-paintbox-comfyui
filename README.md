@@ -7,7 +7,7 @@
 **酒馆安装地址**（扩展 → 安装扩展，填这个仓库地址后刷新）：
 
 ```
-https://github.com/<你的用户名>/witch-paintbox-comfyui
+https://github.com/YoshinoA123/witch-paintbox-comfyui
 ```
 
 > 仓库里已经提交了编译好的 `dist/`，装完即用，不需要自己 build。

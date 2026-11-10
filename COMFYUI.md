@@ -22,7 +22,7 @@ NAI / GPT（OpenAI 兼容）/ Gemini / Grok 四条原有通道的行为、配置
 ```bash
 cd "G:\WorkBuddy\2026-11-10-15-22-23\witch-paintbox-comfyui"
 
-git remote add origin https://github.com/<你的用户名>/witch-paintbox-comfyui.git
+git remote add origin https://github.com/YoshinoA123/witch-paintbox-comfyui.git
 git push -u origin main
 ```
 
@@ -42,7 +42,7 @@ git push -u origin main --force
 扩展 → 安装扩展 → 填：
 
 ```
-https://github.com/<你的用户名>/witch-paintbox-comfyui
+https://github.com/YoshinoA123/witch-paintbox-comfyui
 ```
 
 确定后刷新页面，右下角出现桌宠缇娅就是装好了。
@@ -54,7 +54,7 @@ https://github.com/<你的用户名>/witch-paintbox-comfyui
 把 `witch-paintbox-comfyui` 文件夹放进：
 
 ```
-SillyTavern/data/<你的用户名>/extensions/third-party/witch-paintbox-comfyui
+SillyTavern/data/YoshinoA123/extensions/third-party/witch-paintbox-comfyui
 ```
 
 > 和官方版「魔女画匣」同时安装时，两个插件都会画一只悬浮球和一只桌宠，会互相遮挡。**建议只启用其中一个**。
