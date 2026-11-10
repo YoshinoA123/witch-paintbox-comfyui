@@ -4,6 +4,15 @@
 > 安装、启动参数、工作流导出与排错见 **[COMFYUI.md](./COMFYUI.md)**。
 > NAI / GPT / Gemini / Grok 四路行为与原版一致。
 
+**酒馆安装地址**（扩展 → 安装扩展，填这个仓库地址后刷新）：
+
+```
+https://github.com/<你的用户名>/witch-paintbox-comfyui
+```
+
+> 仓库里已经提交了编译好的 `dist/`，装完即用，不需要自己 build。
+> 使用前记得给 ComfyUI 加 `--enable-cors-header` 启动参数，否则浏览器会拦跨域请求。
+
 每次生图，都是魔女看板娘施展的一次绘图魔法。
 
 独立的 SillyTavern 前端扩展，提供可拖动悬浮球、五个主板块、从上向下展开的金字塔系谱图，以及使用偏好的保存。

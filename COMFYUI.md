@@ -7,15 +7,74 @@ NAI / GPT（OpenAI 兼容）/ Gemini / Grok 四条原有通道的行为、配置
 
 ## 1. 安装
 
-把整个 `witch-paintbox-comfyui` 文件夹放进：
+### 1.1 推送到你的 GitHub（酒馆只认仓库地址时走这条）
+
+本目录**已经初始化成 git 仓库并提交好了**（分支 `main`，239 个文件，工作区干净），你只需要建远端然后推上去。
+
+**第 1 步：在 GitHub 建空仓库**
+
+- Repository name 填 `witch-paintbox-comfyui`
+- 可见性选 **Public**（私有仓库酒馆 clone 会失败，除非在服务器上配凭据）
+- ⚠️ **不要勾** Add a README file / Add .gitignore / Choose a license —— 本地已经有这些文件，勾了首推会冲突
+
+**第 2 步：推送**
+
+```bash
+cd "G:\WorkBuddy\2026-11-10-15-22-23\witch-paintbox-comfyui"
+
+git remote add origin https://github.com/<你的用户名>/witch-paintbox-comfyui.git
+git push -u origin main
+```
+
+推送要认证，GitHub 已经不认账号密码了，二选一：
+
+- **PAT**：GitHub → Settings → Developer settings → Personal access tokens → 生成一个带 `repo` 权限的 token，密码框里粘 token
+- **GitHub Desktop**：把这个目录拖进去，点 Publish repository，最省事
+
+如果报 `rejected` / `failed to push some refs`，说明远端多了个初始 README，直接覆盖（远端是空的，没有东西会丢）：
+
+```bash
+git push -u origin main --force
+```
+
+**第 3 步：在酒馆里装**
+
+扩展 → 安装扩展 → 填：
+
+```
+https://github.com/<你的用户名>/witch-paintbox-comfyui
+```
+
+确定后刷新页面，右下角出现桌宠缇娅就是装好了。
+
+> 安装后的文件夹名 = 仓库名；界面里显示的名字 = `manifest.json` 的 `display_name`（当前是「魔女画匣 · ComfyUI」）。
+
+### 1.2 本地文件夹安装（如果你的酒馆支持）
+
+把 `witch-paintbox-comfyui` 文件夹放进：
 
 ```
 SillyTavern/data/<你的用户名>/extensions/third-party/witch-paintbox-comfyui
 ```
 
-然后在酒馆「扩展」里刷新，页面右下角会出现桌宠缇娅。
-
 > 和官方版「魔女画匣」同时安装时，两个插件都会画一只悬浮球和一只桌宠，会互相遮挡。**建议只启用其中一个**。
+
+### 1.3 以后改完代码怎么更新
+
+酒馆跑的是仓库里提交的 `dist/`，**它自己不会编译**。所以改完源码必须重新构建再推：
+
+```bash
+cd "G:\WorkBuddy\2026-11-10-15-22-23\witch-paintbox-comfyui"
+
+npm run build        # tsc 编译到 dist/
+git add -A
+git commit -m "更新 ComfyUI 面板"
+git push
+```
+
+然后回酒馆：扩展管理里点更新，或点画匣标题栏的铃铛检查更新（这个仓库是 git 安装的，铃铛能正常工作）。
+
+> 判断有没有漏推：`git status` 显示 `nothing to commit` 就说明 dist 已经是最新的。
 
 ---
 
