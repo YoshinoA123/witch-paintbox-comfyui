@@ -1,0 +1,1052 @@
+import { loadImageSettings, saveImageSettings, switchImageProvider } from './image-settings.js';
+import { aspectParameters, imageSettingsView, MORE_PROVIDERS, OPENAI_SIZE_PRESETS } from './image-view.js';
+import { NAI_SIZE_PRESETS, validateImageConnection } from './novelai.js';
+import { fetchOpenAIImageModels, validateOpenAIImageConnection, OPENAI_IMAGE_26_MODELS, supportsOpenAIImageComplexity, openAIImageComplexityHint } from './openai-image.js';
+import { fetchGeminiImageModels } from './gemini-image.js';
+import { fetchGrokImageModels, validateGrokConnection } from './grok-image.js';
+import { inspectComfyWorkflow, testComfyConnection, validateComfyConnection } from './comfyui-image.js';
+import { VibePanel } from './vibe-panel.js';
+import { generateConfiguredImage } from './image-provider.js';
+import { imageFileExtension } from './raster-image.js';
+import { imageChatContext } from './chat-host.js';
+import { saveImageHistory, onImageHistoryChanged } from './image-history.js';
+import { emitPetEvent, petEnd, petFault, petTaskId } from './pet-events.js';
+import { isImageSizeModeSaving, loadModelSettings, saveImageSizeMode } from './model-settings.js';
+import { imageSizeMode } from './image-size-mode.js';
+/** Check one draft connection the same way the matching provider will send it. */
+function validateConnectionFor(settings, connection) {
+    if (settings.provider === 'novelai')
+        return validateImageConnection(connection);
+    if (settings.provider === 'comfy')
+        return validateComfyConnection(connection);
+    if (settings.provider === 'grok')
+        return validateGrokConnection(connection);
+    if (settings.provider === 'gemini') {
+        if (connection.channel === 'custom' || settings.geminiParameters.protocol === 'openai')
+            return validateOpenAIImageConnection(connection);
+        const key = connection.key.trim().replace(/^Bearer\s+/i, '');
+        if (!key || /[^\x21-\x7e]/.test(key))
+            throw new Error('请填写有效的 API 密钥。');
+        return { channel: 'official', url: '', key, appendSuffix: connection.appendSuffix };
+    }
+    return validateOpenAIImageConnection(connection);
+}
+const OFFICIAL_NAMES = {
+    novelai: 'NovelAI 官方', openai: 'OpenAI 官方', gemini: 'Google 官方', grok: 'xAI 官方', comfy: 'ComfyUI 本机',
+};
+function newId() {
+    return `${Date.now().toString(36)}-${crypto.getRandomValues(new Uint32Array(1))[0].toString(36)}`;
+}
+export class ImageConfig {
+    settings = null;
+    loadError = '';
+    connection = { channel: 'official', url: '', key: '', appendSuffix: true };
+    connectionId = '';
+    connectionName = '';
+    artistName = '';
+    container = null;
+    listeners = null;
+    request = null;
+    modelRequest = null;
+    modelOptions = [];
+    moreProviders = false;
+    advancedOpen = false;
+    workflowTimer = null;
+    testing = false;
+    vibePanel = null;
+    imageUrl = '';
+    imageRecord = null;
+    stopImageHistory = onImageHistoryChanged(change => {
+        const record = this.imageRecord;
+        if (!record || !(change.deletedIds?.includes(record.id) || change.before !== undefined && record.createdAt < change.before))
+            return;
+        if (this.imageUrl)
+            URL.revokeObjectURL(this.imageUrl);
+        this.imageUrl = '';
+        this.imageRecord = null;
+        if (!this.request)
+            this.generationMessage = '本机图片已清理。';
+        this.syncGeneration();
+    });
+    imageFilename = 'witch-paintbox.png';
+    generationMessage = '';
+    generationFailed = false;
+    generationPhase = 'queued';
+    writing = false;
+    pendingSaves = 0;
+    saveRevision = 0;
+    get hasPendingWrites() { return this.writing || this.pendingSaves > 0; }
+    constructor() {
+        this.reloadSaved();
+    }
+    reloadSaved(artistsOnly = false) {
+        this.cancelModelRefresh();
+        if (artistsOnly && this.settings) {
+            const saved = loadImageSettings(this.settings.provider);
+            this.settings = { ...this.settings, artists: saved.artists, positive: saved.positive, negative: saved.negative, activeArtistId: saved.activeArtistId };
+            this.artistName = saved.artists.find(item => item.id === saved.activeArtistId)?.name ?? '';
+            this.render();
+            return;
+        }
+        const previousProvider = this.settings?.provider;
+        this.settings = null;
+        this.loadError = '';
+        this.connection = { channel: 'official', url: '', key: '', appendSuffix: true };
+        this.modelOptions = [];
+        this.connectionId = this.connectionName = this.artistName = '';
+        try {
+            this.settings = loadImageSettings();
+            if (previousProvider && previousProvider !== this.settings.provider) {
+                this.request?.abort();
+                this.clearOutput();
+            }
+            this.connection = { ...this.settings.connection };
+            this.modelOptions = [...this.settings.models];
+            this.connectionId = this.settings.activeConnectionId;
+            this.connectionName = this.settings.connectionProfiles.find(item => item.id === this.connectionId)?.name ?? '';
+            this.artistName = this.settings.artists.find(item => item.id === this.settings.activeArtistId)?.name ?? '';
+        }
+        catch (error) {
+            this.loadError = error.message;
+        }
+        this.render();
+    }
+    mount(container) {
+        this.unmount();
+        this.container = container;
+        this.listeners = new AbortController();
+        const { signal } = this.listeners;
+        container.addEventListener('input', event => this.edit(event), { signal });
+        container.addEventListener('change', event => { void this.select(event); }, { signal });
+        container.addEventListener('click', event => { void this.click(event); }, { signal });
+        window.addEventListener('witch-paintbox:model-settings-changed', () => this.syncImageSizeMode(), { signal });
+        window.addEventListener('witch-paintbox:image-size-mode-saving', () => this.syncImageSizeMode(), { signal });
+        this.render();
+    }
+    unmount() {
+        this.maskKey();
+        this.cancelModelRefresh();
+        this.flushWorkflowSave();
+        this.listeners?.abort();
+        this.container = null;
+    }
+    maskKey() {
+        const input = this.container?.querySelector('[data-connection="key"]');
+        if (input)
+            input.type = 'password';
+        const toggle = this.container?.querySelector('[data-action="toggle-key"]');
+        if (toggle) {
+            toggle.textContent = '显示';
+            toggle.setAttribute('aria-pressed', 'false');
+        }
+    }
+    destroy() {
+        this.vibePanel?.destroy();
+        this.stopImageHistory();
+        this.unmount();
+        this.request?.abort();
+        if (this.imageUrl)
+            URL.revokeObjectURL(this.imageUrl);
+    }
+    isConnectionSaved() {
+        const profile = this.settings?.connectionProfiles.find(item => item.id === this.connectionId);
+        return !!profile && profile.name === this.connectionName
+            && profile.channel === this.connection.channel && profile.url === this.connection.url
+            && profile.appendSuffix === this.connection.appendSuffix
+            && profile.key === this.connection.key && this.settings?.activeConnectionId === profile.id;
+    }
+    render() {
+        if (!this.container)
+            return;
+        if (!this.settings) {
+            const message = document.createElement('p');
+            message.setAttribute('role', 'alert');
+            message.textContent = this.loadError;
+            this.container.replaceChildren(message);
+            return;
+        }
+        this.container.innerHTML = imageSettingsView({ ...this.settings, connection: this.connection, activeConnectionId: this.connectionId, models: this.modelOptions }, { connectionName: this.connectionName, artistName: this.artistName, connectionSaved: this.isConnectionSaved(), refreshing: this.modelRequest !== null, moreOpen: this.moreProviders, advancedOpen: this.advancedOpen });
+        this.mountVibes();
+        this.syncParameters();
+        this.syncOpenAIComplexity();
+        this.syncImageSizeMode();
+        this.renderWorkflowReport();
+        this.syncGeneration();
+    }
+    message(area, text, error = false) {
+        const node = this.container?.querySelector(`[data-${area}-status]`);
+        if (!node)
+            return;
+        node.textContent = text;
+        node.classList.toggle('is-error', error);
+    }
+    async persist(area) {
+        const settings = this.settings;
+        const revision = ++this.saveRevision;
+        this.pendingSaves++;
+        try {
+            await saveImageSettings(structuredClone(settings));
+            if (revision === this.saveRevision && this.settings === settings)
+                this.message(area, '已保存。');
+        }
+        catch (error) {
+            if (revision === this.saveRevision && this.settings === settings)
+                this.message(area, error.message, true);
+        }
+        finally {
+            this.pendingSaves--;
+        }
+    }
+    async write(action) {
+        if (this.writing)
+            return;
+        this.writing = true;
+        const controls = Array.from(this.container?.querySelectorAll('input, select, textarea, button') ?? []);
+        const disabled = controls.map(control => control.disabled);
+        controls.forEach(control => { control.disabled = true; });
+        try {
+            await action();
+        }
+        finally {
+            this.writing = false;
+            controls.forEach((control, index) => { if (control.isConnected)
+                control.disabled = disabled[index]; });
+            this.syncProviderButtons();
+            this.syncImageSizeMode();
+        }
+    }
+    edit(event) {
+        if (this.writing)
+            return;
+        const field = event.target;
+        if (!(field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement))
+            return;
+        const settings = this.settings;
+        const connectionField = field.dataset.connection;
+        if (connectionField === 'appendSuffix' && field instanceof HTMLInputElement) {
+            this.cancelModelRefresh();
+            if (this.connection.appendSuffix !== field.checked)
+                this.clearModels();
+            this.connection.appendSuffix = field.checked;
+            this.syncConnection();
+            return;
+        }
+        if (connectionField === 'channel' || connectionField === 'url' || connectionField === 'key') {
+            this.cancelModelRefresh();
+            if (this.connection[connectionField] !== field.value)
+                this.clearModels();
+            if (connectionField === 'channel')
+                this.connection.channel = field.value === 'custom' ? 'custom' : 'official';
+            else
+                this.connection[connectionField] = field.value;
+            this.syncConnection();
+            return;
+        }
+        if (field.dataset.field === 'connectionName') {
+            this.connectionName = field.value;
+            this.syncConnection();
+            return;
+        }
+        if (field.dataset.field === 'artistName') {
+            this.artistName = field.value;
+            return;
+        }
+        if (field.dataset.field === 'positive' || field.dataset.field === 'negative') {
+            settings[field.dataset.field] = field.value;
+            void this.persist('artist');
+            return;
+        }
+        const parameter = field.dataset.parameter;
+        if (settings.provider === 'comfy') {
+            if (parameter)
+                this.editComfy(settings, parameter, field);
+            return;
+        }
+        if (settings.provider === 'gemini' || settings.provider === 'grok') {
+            if (parameter)
+                this.editAspect(settings, parameter, field.value);
+            return;
+        }
+        const parameters = settings.provider === 'openai' ? settings.openaiParameters : settings.parameters;
+        if (!parameter || !Object.hasOwn(parameters, parameter))
+            return;
+        if (parameter === 'width' || parameter === 'height')
+            this.syncSizePreset();
+        if (field instanceof HTMLInputElement && !field.checkValidity())
+            return;
+        if (settings.provider === 'openai') {
+            switch (parameter) {
+                case 'model':
+                    settings.openaiParameters.model = field.value;
+                    this.syncOpenAIComplexity();
+                    break;
+                case 'complexity':
+                    settings.openaiParameters.complexity = field.value;
+                    break;
+                case 'quality':
+                    settings.openaiParameters.quality = field.value;
+                    break;
+                case 'width':
+                case 'height':
+                    if (field.value === '')
+                        return;
+                    settings.openaiParameters[parameter] = Number(field.value);
+                    break;
+            }
+            void this.persist('settings');
+            return;
+        }
+        switch (parameter) {
+            case 'model':
+            case 'sampler':
+            case 'noiseSchedule':
+                settings.parameters[parameter] = field.value;
+                if (parameter === 'model')
+                    this.vibePanel?.setModel(field.value);
+                break;
+            case 'sm':
+            case 'smDyn':
+                settings.parameters[parameter] = field.checked;
+                break;
+            case 'width':
+            case 'height':
+            case 'steps':
+            case 'scale':
+            case 'seed':
+            case 'cfgRescale':
+                if (field.value === '')
+                    return;
+                settings.parameters[parameter] = Number(field.value);
+                break;
+        }
+        this.syncParameters();
+        void this.persist('settings');
+    }
+    editAspect(settings, parameter, value) {
+        const target = (settings.provider === 'gemini' ? settings.geminiParameters : settings.grokParameters);
+        if (!Object.hasOwn(target, parameter) || target[parameter] === value)
+            return;
+        target[parameter] = value;
+        if (parameter === 'protocol') {
+            // Protocol changes the URL suffix and the model list endpoint; redraw and drop stale lists.
+            this.cancelModelRefresh();
+            this.clearModels();
+            this.render();
+            this.message('settings', '接口协议已切换；如使用中转站，请确认服务 URL。');
+        }
+        else if (parameter !== 'model') {
+            this.render();
+        }
+        else {
+            // Typing a model name keeps focus; only the ratio block (resolution lock and hint) is redrawn.
+            const block = this.container?.querySelector('[data-aspect-block]');
+            if (block) {
+                block.innerHTML = aspectParameters(settings);
+                this.syncImageSizeMode();
+            }
+        }
+        void this.persist('settings');
+    }
+    /** ComfyUI 的参数分散在两处：采样参数进 comfyParameters，工作流与超时进 comfyWorkflow。 */
+    editComfy(settings, parameter, field) {
+        if (parameter === 'workflow') {
+            settings.comfyWorkflow.workflow = field.value;
+            // 100 KB 级的 JSON 不在每次按键都落盘，停下来之后再存。
+            this.scheduleWorkflowSave();
+            return;
+        }
+        if (parameter === 'timeoutSeconds' || parameter === 'pollMs') {
+            if (field.value === '' || !field.checkValidity())
+                return;
+            const value = Number(field.value);
+            if (parameter === 'timeoutSeconds')
+                settings.comfyWorkflow.timeoutSeconds = value;
+            else
+                settings.comfyWorkflow.pollMs = value;
+            void this.persist('settings');
+            return;
+        }
+        const parameters = settings.comfyParameters;
+        switch (parameter) {
+            case 'sampler':
+                parameters.sampler = field.value;
+                break;
+            case 'scheduler':
+                parameters.scheduler = field.value;
+                break;
+            case 'outputNode':
+                parameters.outputNode = field.value;
+                break;
+            case 'steps':
+            case 'cfg':
+            case 'seed':
+            case 'batch':
+            case 'width':
+            case 'height':
+                if (field.value === '' || !field.checkValidity())
+                    return;
+                parameters[parameter] = Number(field.value);
+                if (parameter === 'width' || parameter === 'height')
+                    this.syncSizePreset();
+                break;
+            default: return;
+        }
+        void this.persist('settings');
+    }
+    scheduleWorkflowSave() {
+        if (this.workflowTimer)
+            clearTimeout(this.workflowTimer);
+        this.workflowTimer = setTimeout(() => {
+            this.workflowTimer = null;
+            this.renderWorkflowReport();
+            void this.persist('settings');
+        }, 700);
+    }
+    /** 收起面板时把还没落盘的工作流写下去，避免白敲一段 JSON。 */
+    flushWorkflowSave() {
+        if (!this.workflowTimer)
+            return;
+        clearTimeout(this.workflowTimer);
+        this.workflowTimer = null;
+        if (this.settings?.provider === 'comfy')
+            void this.persist('settings');
+    }
+    renderWorkflowReport() {
+        const node = this.container?.querySelector('[data-workflow-report]');
+        if (!node)
+            return;
+        const workflow = this.settings?.comfyWorkflow.workflow ?? '';
+        node.classList.remove('is-error');
+        if (!workflow.trim()) {
+            node.textContent = '还没有工作流。粘贴 ComfyUI 的 API 格式 JSON 后点「校验工作流」，这里会列出识别到的提示词、采样和画幅节点。';
+            return;
+        }
+        try {
+            const report = inspectComfyWorkflow(workflow);
+            const lines = [...report.lines, ...report.warnings.map(warning => `⚠ ${warning}`)];
+            node.textContent = `识别到 ${report.nodes} 个节点：\n${lines.join('\n')}`;
+            if (report.warnings.length)
+                node.classList.add('is-warning');
+        }
+        catch (error) {
+            node.textContent = error.message;
+            node.classList.add('is-error');
+        }
+    }
+    async testConnection() {
+        if (this.testing)
+            return;
+        const node = this.container?.querySelector('[data-test-status]');
+        const button = this.container?.querySelector('[data-action="test-connection"]');
+        this.testing = true;
+        if (button) {
+            button.disabled = true;
+            button.textContent = '测试中…';
+        }
+        if (node) {
+            node.textContent = '正在连接…';
+            node.classList.remove('is-error');
+        }
+        try {
+            const message = await testComfyConnection({ ...this.connection });
+            if (node)
+                node.textContent = message;
+        }
+        catch (error) {
+            if (node) {
+                node.textContent = error.message;
+                node.classList.add('is-error');
+            }
+        }
+        finally {
+            this.testing = false;
+            if (button && button.isConnected) {
+                button.disabled = false;
+                button.textContent = '测试连接';
+            }
+        }
+    }
+    syncConnection() {
+        const saved = this.isConnectionSaved();
+        const line = this.container?.querySelector('.credential-line');
+        if (line)
+            line.dataset.saved = String(saved);
+        const button = this.container?.querySelector('[data-action="save-connection"]');
+        if (button)
+            button.disabled = saved;
+        const url = this.container?.querySelector('[data-custom-url]');
+        if (url)
+            url.hidden = this.connection.channel !== 'custom';
+        this.message('connection', saved ? '已保存。' : '当前密钥配置尚未保存。');
+    }
+    syncParameters() {
+        if (this.settings.provider !== 'novelai')
+            return;
+        const p = this.settings.parameters;
+        const legacy = p.model === 'nai-diffusion-3';
+        if (!legacy)
+            p.sm = p.smDyn = false;
+        if (!p.sm)
+            p.smDyn = false;
+        if (p.model.startsWith('nai-diffusion-5') || (!legacy && p.noiseSchedule === 'native'))
+            p.noiseSchedule = 'karras';
+        for (const key of ['sm', 'smDyn']) {
+            const input = this.container?.querySelector(`[data-parameter="${key}"]`);
+            if (input) {
+                input.disabled = !legacy || (key === 'smDyn' && !p.sm);
+                input.checked = p[key];
+            }
+        }
+        const schedule = this.container?.querySelector('[data-parameter="noiseSchedule"]');
+        if (schedule) {
+            schedule.disabled = p.model.startsWith('nai-diffusion-5') || p.sampler === 'k_dpm_fast';
+            schedule.value = p.noiseSchedule;
+            const native = schedule.querySelector('option[value="native"]');
+            if (native)
+                native.disabled = !legacy;
+        }
+    }
+    syncOpenAIComplexity() {
+        if (this.settings?.provider !== 'openai' || !this.container)
+            return;
+        const model = this.settings.openaiParameters.model;
+        const input = this.container.querySelector('[data-parameter="complexity"]');
+        if (input)
+            input.disabled = !supportsOpenAIImageComplexity(model);
+        const hint = this.container.querySelector('[data-complexity-hint]');
+        if (hint)
+            hint.textContent = openAIImageComplexityHint(model);
+    }
+    syncSizePreset() {
+        const width = this.container?.querySelector('[data-parameter="width"]');
+        const height = this.container?.querySelector('[data-parameter="height"]');
+        const select = this.container?.querySelector('[data-field="sizePreset"]');
+        if (width && height && select) {
+            const presets = this.settings.provider === 'openai' ? OPENAI_SIZE_PRESETS : NAI_SIZE_PRESETS;
+            select.value = presets.find(item => item.width === width.valueAsNumber && item.height === height.valueAsNumber)?.value ?? 'custom';
+        }
+    }
+    syncImageSizeMode() {
+        if (!this.settings || !this.container)
+            return;
+        let mode = 'fixed', error = '';
+        try {
+            mode = imageSizeMode(loadModelSettings(this.settings.provider));
+        }
+        catch (failure) {
+            error = failure.message;
+        }
+        for (const button of Array.from(this.container.querySelectorAll('[data-size-mode]'))) {
+            button.setAttribute('aria-pressed', String(button.dataset.sizeMode === mode));
+            button.disabled = this.writing || isImageSizeModeSaving() || Boolean(error);
+        }
+        const aspect = this.settings.provider === 'gemini' || this.settings.provider === 'grok';
+        const label = this.container.querySelector('[data-size-selection-label]');
+        if (label)
+            label.textContent = aspect ? mode === 'ai' ? '兜底比例' : '画面比例' : mode === 'ai' ? '兜底尺寸' : '预设尺寸';
+        this.message('size-mode', error || (isImageSizeModeSaving() ? '正在同步画幅模式…' : aspect ? mode === 'ai'
+            ? 'AI 动态画幅启用中：配图标记里的 7 种画幅会换成对应比例（1:1 / 2:3 / 3:2 / 3:4 / 4:3 / 9:16 / 16:9），按下方分辨率生成；没写画幅时用兜底比例。'
+            : '所有配图使用下方比例与分辨率。切换模式会互斥启用当前模型 API 预设中的同名格式条目。' : mode === 'ai'
+            ? '按每张配图返回的 size 选择画幅；缺少或不支持的尺寸使用下方兜底尺寸。'
+            : '所有配图使用下方画幅。切换模式会互斥启用当前模型 API 预设中的同名格式条目。'), Boolean(error));
+    }
+    async select(event) {
+        if (this.writing)
+            return;
+        const field = event.target;
+        if (!(field instanceof HTMLSelectElement))
+            return;
+        const settings = this.settings;
+        if (field.dataset.field === 'sizePreset') {
+            const presets = settings.provider === 'openai' ? OPENAI_SIZE_PRESETS : NAI_SIZE_PRESETS;
+            const parameters = settings.provider === 'openai' ? settings.openaiParameters
+                : settings.provider === 'comfy' ? settings.comfyParameters : settings.parameters;
+            const preset = presets.find(item => item.value === field.value);
+            if (preset) {
+                for (const dimension of ['width', 'height']) {
+                    parameters[dimension] = preset[dimension];
+                    const input = this.container?.querySelector(`[data-parameter="${dimension}"]`);
+                    if (input)
+                        input.value = String(preset[dimension]);
+                }
+                void this.persist('settings');
+            }
+            return;
+        }
+        if (field.dataset.field !== 'connectionProfile' && field.dataset.field !== 'artistPreset')
+            return;
+        try {
+            await this.write(async () => {
+                if (field.dataset.field === 'connectionProfile') {
+                    this.cancelModelRefresh();
+                    this.clearModels();
+                    const profile = settings.connectionProfiles.find(item => item.id === field.value);
+                    if (profile) {
+                        const connection = { channel: profile.channel, url: profile.url, key: profile.key, appendSuffix: profile.appendSuffix };
+                        const next = { ...settings, connection, activeConnectionId: profile.id };
+                        await saveImageSettings(next);
+                        this.settings = next;
+                        this.connection = { ...connection };
+                    }
+                    else {
+                        this.connection = { channel: 'official', url: '', key: '', appendSuffix: true };
+                    }
+                    this.connectionId = profile?.id ?? '';
+                    this.connectionName = profile?.name ?? '';
+                    this.render();
+                }
+                if (field.dataset.field === 'artistPreset') {
+                    const preset = settings.artists.find(item => item.id === field.value);
+                    const next = {
+                        ...settings, activeArtistId: preset?.id ?? '',
+                        positive: preset?.positive ?? settings.positive, negative: preset?.negative ?? settings.negative,
+                    };
+                    await saveImageSettings(next);
+                    this.settings = next;
+                    this.artistName = preset?.name ?? '';
+                    this.render();
+                }
+            });
+        }
+        catch (error) {
+            this.message(field.dataset.field === 'connectionProfile' ? 'connection' : 'artist', error.message, true);
+            field.value = field.dataset.field === 'connectionProfile' ? this.connectionId : settings.activeArtistId;
+        }
+    }
+    async click(event) {
+        const target = event.target;
+        if (!(target instanceof Element))
+            return;
+        const action = target.closest('button[data-action]')?.dataset.action;
+        if (!action || this.writing)
+            return;
+        try {
+            switch (action) {
+                case 'toggle-key': {
+                    const input = this.container.querySelector('[data-connection="key"]');
+                    const button = target.closest('button');
+                    input.type = input.type === 'password' ? 'text' : 'password';
+                    button.textContent = input.type === 'password' ? '显示' : '隐藏';
+                    button.setAttribute('aria-pressed', String(input.type === 'text'));
+                    break;
+                }
+                case 'save-connection':
+                    await this.write(() => this.saveConnection());
+                    break;
+                case 'switch-provider': {
+                    const provider = target.closest('button')?.dataset.provider;
+                    if (provider === 'novelai' || provider === 'openai' || provider === 'gemini' || provider === 'grok' || provider === 'comfy')
+                        await this.changeProvider(provider);
+                    break;
+                }
+                case 'test-connection':
+                    await this.testConnection();
+                    break;
+                case 'inspect-workflow':
+                    this.flushWorkflowSave();
+                    this.renderWorkflowReport();
+                    break;
+                case 'clear-workflow': {
+                    if (!this.settings?.comfyWorkflow.workflow)
+                        break;
+                    await this.write(async () => {
+                        this.settings.comfyWorkflow.workflow = '';
+                        await saveImageSettings(structuredClone(this.settings));
+                        const field = this.container?.querySelector('[data-parameter="workflow"]');
+                        if (field)
+                            field.value = '';
+                        this.renderWorkflowReport();
+                    });
+                    break;
+                }
+                case 'toggle-more-providers':
+                    this.toggleMoreProviders();
+                    break;
+                case 'toggle-advanced':
+                    this.toggleAdvanced();
+                    break;
+                case 'refresh-models':
+                    void this.refreshModels();
+                    break;
+                case 'select-size-mode': {
+                    if (isImageSizeModeSaving())
+                        return;
+                    const mode = target.closest('button')?.dataset.sizeMode;
+                    if (mode === 'fixed' || mode === 'ai') {
+                        await this.write(() => saveImageSizeMode(this.settings.provider, mode));
+                    }
+                    break;
+                }
+                case 'save-artist':
+                case 'update-artist':
+                case 'delete-artist':
+                    await this.write(() => this.saveArtist(action));
+                    break;
+                case 'generate':
+                    void this.generate();
+                    break;
+                case 'cancel-generation':
+                    this.request?.abort();
+                    break;
+            }
+        }
+        catch (error) {
+            this.message(action === 'save-connection' ? 'connection' : action === 'switch-provider' ? 'settings'
+                : action === 'select-size-mode' ? 'size-mode' : 'artist', error.message, true);
+        }
+    }
+    async saveConnection() {
+        this.cancelModelRefresh();
+        const connection = validateConnectionFor(this.settings, this.connection);
+        // Store the entered URL so disabling suffix completion does not keep an appended path.
+        if (connection.channel === 'custom')
+            connection.url = this.connection.url.trim();
+        const name = this.connectionName.trim() || (connection.channel === 'official' ? OFFICIAL_NAMES[this.settings.provider] : new URL(connection.url).host);
+        const id = this.connectionId || newId();
+        const settings = this.settings;
+        if (settings.connectionProfiles.some(item => item.id !== id && item.name === name)) {
+            throw new Error('已有同名连接配置，请选中它后保存，或使用其他名称。');
+        }
+        const profile = { ...connection, id, name };
+        const next = {
+            ...settings, connection, activeConnectionId: id,
+            models: settings.provider === 'novelai' ? settings.models : [...this.modelOptions],
+            connectionProfiles: settings.connectionProfiles.some(item => item.id === id)
+                ? settings.connectionProfiles.map(item => item.id === id ? profile : item)
+                : [...settings.connectionProfiles, profile],
+        };
+        await saveImageSettings(next);
+        this.settings = next;
+        this.connection = { ...connection };
+        this.connectionName = name;
+        this.connectionId = id;
+        this.render();
+        this.message('connection', '已保存。');
+    }
+    async saveArtist(action) {
+        const settings = this.settings;
+        const current = settings.artists.find(item => item.id === settings.activeArtistId);
+        let next;
+        if (action === 'delete-artist') {
+            if (!current)
+                throw new Error('请先选择要删除的配置。');
+            next = { ...settings, artists: settings.artists.filter(item => item.id !== current.id), activeArtistId: '' };
+        }
+        else {
+            const name = this.artistName.trim();
+            if (!name)
+                throw new Error('请填写配置名称。');
+            if (action === 'update-artist' && !current)
+                throw new Error('请先选择要更新的配置。');
+            const id = action === 'update-artist' ? current.id : newId();
+            if (settings.artists.some(item => item.id !== id && item.name === name)) {
+                throw new Error('已有同名配置，请使用“更新”，或填写其他名称后保存。');
+            }
+            const preset = { id, name, positive: settings.positive, negative: settings.negative };
+            next = {
+                ...settings, activeArtistId: id,
+                artists: action === 'update-artist' ? settings.artists.map(item => item.id === id ? preset : item) : [...settings.artists, preset],
+            };
+        }
+        await saveImageSettings(next);
+        this.settings = next;
+        if (action === 'delete-artist')
+            this.artistName = '';
+        else
+            this.artistName = this.artistName.trim();
+        this.render();
+        this.message('artist', action === 'delete-artist' ? '配置已删除，当前填写的提示词仍保留。' : '配置已保存。');
+    }
+    validParameters() {
+        const fields = this.container?.querySelectorAll('[data-parameter]') ?? [];
+        for (const field of Array.from(fields)) {
+            if (field.checkValidity())
+                continue;
+            const drawer = field.closest('details');
+            if (drawer)
+                drawer.open = true;
+            field.reportValidity();
+            return false;
+        }
+        return true;
+    }
+    clearOutput() {
+        if (this.imageUrl)
+            URL.revokeObjectURL(this.imageUrl);
+        this.imageUrl = '';
+        this.imageRecord = null;
+        this.generationMessage = '';
+        this.generationFailed = false;
+    }
+    syncProviderButtons() {
+        for (const button of Array.from(this.container?.querySelectorAll('[data-action="switch-provider"]') ?? [])) {
+            button.disabled = this.writing || this.request !== null;
+        }
+    }
+    mountVibes() {
+        this.vibePanel?.destroy();
+        this.vibePanel = null;
+        const host = this.container?.querySelector('[data-vibe-host]');
+        if (!host || !this.advancedOpen || this.settings?.provider !== 'novelai')
+            return;
+        this.vibePanel = new VibePanel();
+        this.vibePanel.mount(host, this.settings.parameters.model);
+    }
+    toggleAdvanced() {
+        this.advancedOpen = !this.advancedOpen;
+        const wrap = this.container?.querySelector('.advanced-features');
+        const toggle = wrap?.querySelector('[data-action="toggle-advanced"]');
+        const panel = wrap?.querySelector('.advanced-panel');
+        if (!wrap || !toggle || !panel)
+            return;
+        wrap.dataset.open = String(this.advancedOpen);
+        toggle.setAttribute('aria-expanded', String(this.advancedOpen));
+        panel.hidden = !this.advancedOpen;
+        this.mountVibes();
+    }
+    /** The paper strip stays open while a folded-away provider is the active brush. */
+    toggleMoreProviders() {
+        const provider = this.settings?.provider;
+        if (provider && MORE_PROVIDERS.includes(provider))
+            return;
+        this.moreProviders = !this.moreProviders;
+        const group = this.container?.querySelector('.image-provider-switch');
+        const toggle = group?.querySelector('[data-action="toggle-more-providers"]');
+        const strip = group?.querySelector('.provider-more-strip');
+        if (!group || !toggle || !strip)
+            return;
+        group.dataset.moreOpen = String(this.moreProviders);
+        toggle.setAttribute('aria-expanded', String(this.moreProviders));
+        toggle.querySelector('.provider-more-label').textContent = this.moreProviders ? '收起' : '更多画笔';
+        strip.hidden = !this.moreProviders;
+        for (const button of Array.from(strip.querySelectorAll('button'))) {
+            if (this.moreProviders)
+                button.removeAttribute('tabindex');
+            else
+                button.tabIndex = -1;
+        }
+    }
+    async changeProvider(provider) {
+        if (!this.settings || provider === this.settings.provider || this.request || !this.validParameters())
+            return;
+        this.cancelModelRefresh();
+        this.flushWorkflowSave();
+        await this.write(async () => {
+            // The connection editor is a separate draft: switching never confirms an unsaved key.
+            await saveImageSettings(structuredClone(this.settings));
+            await switchImageProvider(provider);
+            // 离开折在纸带里的画笔时把纸条收回去。
+            this.moreProviders = MORE_PROVIDERS.includes(provider);
+            this.clearOutput();
+            this.reloadSaved();
+        });
+    }
+    cancelModelRefresh() {
+        const refreshing = this.modelRequest !== null;
+        this.modelRequest?.abort();
+        this.modelRequest = null;
+        this.syncModelRefresh();
+        if (refreshing)
+            this.message('model-list', '');
+    }
+    clearModels() {
+        if (!this.settings || this.settings.provider === 'novelai' || this.settings.provider === 'comfy')
+            return;
+        this.modelOptions = [];
+        this.settings.models = [];
+        const list = this.container?.querySelector('#witch-image-model-options');
+        if (list) {
+            list.replaceChildren();
+            if (this.settings.provider === 'openai')
+                for (const model of OPENAI_IMAGE_26_MODELS) {
+                    const option = document.createElement('option');
+                    option.value = model;
+                    list.append(option);
+                }
+        }
+    }
+    syncModelRefresh() {
+        const button = this.container?.querySelector('[data-action="refresh-models"]');
+        if (!button)
+            return;
+        button.disabled = this.writing || this.modelRequest !== null;
+        button.textContent = this.modelRequest ? '刷新中…' : '刷新列表';
+    }
+    async refreshModels() {
+        const settings = this.settings;
+        if (!settings || settings.provider === 'novelai' || settings.provider === 'comfy' || this.modelRequest)
+            return;
+        const request = new AbortController();
+        this.modelRequest = request;
+        this.syncModelRefresh();
+        this.message('model-list', '正在获取模型列表…');
+        const connection = { ...this.connection };
+        const current = () => this.modelRequest === request && !request.signal.aborted && this.settings === settings;
+        try {
+            const models = settings.provider === 'gemini' ? await fetchGeminiImageModels(connection, settings.geminiParameters, request.signal)
+                : settings.provider === 'grok' && settings.grokParameters.protocol === 'xai' ? await fetchGrokImageModels(connection, request.signal)
+                    : await fetchOpenAIImageModels(connection, request.signal);
+            if (!current())
+                return;
+            if (!models.length) {
+                this.message('model-list', '接口没有返回可选模型，已保留原列表，可手动填写模型名称。');
+                return;
+            }
+            this.modelOptions = models;
+            const list = this.container?.querySelector('#witch-image-model-options');
+            if (list) {
+                const fragment = document.createDocumentFragment();
+                for (const model of new Set([...(settings.provider === 'openai' ? OPENAI_IMAGE_26_MODELS : []), ...models])) {
+                    const option = document.createElement('option');
+                    option.value = model;
+                    fragment.append(option);
+                }
+                list.replaceChildren(fragment);
+            }
+            const savedConnection = settings.connection;
+            const confirmed = connection.channel === savedConnection.channel && connection.url === savedConnection.url
+                && connection.key === savedConnection.key && connection.appendSuffix === savedConnection.appendSuffix;
+            if (confirmed) {
+                settings.models = models;
+                this.pendingSaves++;
+                try {
+                    await saveImageSettings(structuredClone(settings));
+                }
+                finally {
+                    this.pendingSaves--;
+                }
+            }
+            if (current())
+                this.message('model-list', `已获取 ${models.length} 个模型，当前填写的模型名称保持不变。${confirmed ? '' : '保存当前连接后会保留此列表。'}`);
+        }
+        catch (error) {
+            if (current())
+                this.message('model-list', error.message, true);
+        }
+        finally {
+            if (this.modelRequest === request)
+                this.modelRequest = null;
+            this.syncModelRefresh();
+        }
+    }
+    async generate() {
+        if (this.request)
+            return;
+        if (!this.validParameters())
+            return;
+        this.generationFailed = false;
+        if (!this.isConnectionSaved()) {
+            this.generationMessage = '请先保存当前密钥配置。';
+            this.generationFailed = true;
+            this.syncGeneration();
+            emitPetEvent({ type: 'end', id: petTaskId(), task: 'image', source: 'config', result: 'failed', fault: 'setup', message: this.generationMessage });
+            return;
+        }
+        const request = new AbortController();
+        this.request = request;
+        this.generationPhase = 'queued';
+        this.generationMessage = '正在加入队列…';
+        this.syncGeneration();
+        const snapshot = structuredClone(this.settings);
+        const pet = petTaskId();
+        const endPet = petEnd();
+        const petImage = { type: 'end', id: pet, task: 'image', source: 'config' };
+        emitPetEvent({ type: 'image', id: pet, source: 'config', phase: 'start', provider: snapshot.provider });
+        const source = imageChatContext();
+        try {
+            const result = await generateConfiguredImage(snapshot, snapshot.positive, request.signal, progress => {
+                if (request.signal.aborted || this.settings?.provider !== snapshot.provider)
+                    return;
+                this.generationPhase = progress.state;
+                // ComfyUI 会带来采样步数或服务端排队位置，优先显示它。
+                this.generationMessage = progress.detail
+                    ?? (progress.state === 'queued' ? `等待绘制 · 队列第 ${progress.position} 位` : '正在生成图片…');
+                emitPetEvent({ type: 'image', id: pet, source: 'config', phase: progress.state,
+                    position: progress.state === 'queued' ? progress.position : undefined, columns: progress.columns });
+                this.syncGeneration();
+            });
+            if (request.signal.aborted || this.settings?.provider !== snapshot.provider) {
+                endPet({ ...petImage, result: 'dropped', paid: true, message: '' });
+                return;
+            }
+            const url = URL.createObjectURL(result.blob);
+            if (this.imageUrl)
+                URL.revokeObjectURL(this.imageUrl);
+            this.imageUrl = url;
+            this.imageFilename = `witch-paintbox-${result.seed ?? Date.now()}.${imageFileExtension(result.blob)}`;
+            this.generationMessage = result.seed === undefined ? '生成完成。' : `生成完成 · 种子 ${result.seed}`;
+            endPet({ ...petImage, result: 'done', message: this.generationMessage, picture: {
+                    blob: result.blob, width: result.parameters.width, height: result.parameters.height,
+                    target: () => this.container?.querySelector('[data-output] img') ?? null,
+                } });
+            const id = newId();
+            const entry = {
+                ...result, id, createdAt: Date.now(), title: '绘图工坊 · 试绘', sourceName: source?.name,
+                markerKey: JSON.stringify([source?.scope ?? 'unassigned', source?.chatId ?? '', 'workshop', id]),
+                scenePrompt: snapshot.positive,
+            };
+            this.imageRecord = { id, createdAt: entry.createdAt };
+            this.pendingSaves++;
+            try {
+                await saveImageHistory(entry);
+                emitPetEvent({ type: 'history', id: pet, saved: true, message: this.generationMessage });
+            }
+            catch (error) {
+                if (this.settings?.provider === snapshot.provider)
+                    this.generationMessage = `图片已生成，但未能保存到回顾：${error instanceof Error ? error.message : '存储不可用'}`;
+                emitPetEvent({ type: 'history', id: pet, saved: false, message: this.generationMessage });
+            }
+            finally {
+                this.pendingSaves--;
+            }
+        }
+        catch (error) {
+            if (this.settings?.provider !== snapshot.provider) {
+                endPet({ ...petImage, result: 'dropped', message: '' });
+                return;
+            }
+            this.generationFailed = !request.signal.aborted;
+            this.generationMessage = request.signal.aborted
+                ? this.generationPhase === 'queued' ? '已取消排队。' : '已取消等待，服务端任务可能仍在继续。'
+                : error.message;
+            endPet({ ...petImage, result: request.signal.aborted ? 'cancelled' : 'failed', message: this.generationMessage,
+                fault: request.signal.aborted ? undefined : petFault(error), serverMayContinue: request.signal.aborted && this.generationPhase !== 'queued' });
+        }
+        finally {
+            endPet({ ...petImage, result: 'dropped', message: '' });
+            this.request = null;
+            this.syncGeneration();
+        }
+    }
+    syncGeneration() {
+        if (!this.container || !this.settings)
+            return;
+        this.syncProviderButtons();
+        const busy = this.request !== null;
+        const button = this.container.querySelector('[data-action="generate"]');
+        button.disabled = busy;
+        button.querySelector('strong').textContent = busy ? this.generationPhase === 'queued' ? '已加入队列' : '正在生成…' : this.imageUrl ? '再次生成图片' : '点击生成图片';
+        const cancel = this.container.querySelector('[data-action="cancel-generation"]');
+        cancel.hidden = !busy;
+        cancel.textContent = this.generationPhase === 'queued' ? '取消排队' : '取消等待';
+        const message = this.container.querySelector('[data-generation-status]');
+        message.textContent = this.generationMessage;
+        message.classList.toggle('is-error', this.generationFailed);
+        const output = this.container.querySelector('[data-output]');
+        if (this.imageUrl && output.dataset.url !== this.imageUrl) {
+            const image = document.createElement('img');
+            image.src = this.imageUrl;
+            image.alt = '本次生成的图片';
+            const download = document.createElement('a');
+            download.href = this.imageUrl;
+            download.download = this.imageFilename;
+            download.textContent = '保存图片';
+            output.replaceChildren(image, download);
+            output.dataset.url = this.imageUrl;
+        }
+        else if (!this.imageUrl && output.dataset.url) {
+            output.replaceChildren();
+            delete output.dataset.url;
+        }
+    }
+}

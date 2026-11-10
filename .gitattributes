@@ -1,0 +1,10 @@
+# 统一按 LF 存储，避免 Windows 与 Linux（酒馆常在 Linux 上跑）之间换行符来回变动
+* text=auto eol=lf
+
+# 二进制资源不做换行符转换
+*.webp binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

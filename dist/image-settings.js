@@ -1,0 +1,246 @@
+import { createSettingsStorage } from './host-settings.js';
+import { defaultOpenAIImageParameters, validateOpenAIImageParameters } from './openai-image.js';
+import { withFault } from './pet-events.js';
+import { defaultGeminiImageParameters, defaultGrokImageParameters, validateGeminiImageParameters, validateGrokImageParameters, } from './aspect-image.js';
+import { COMFY_DEFAULT_URL, defaultComfyImageParameters, defaultComfyWorkflowSettings, validateComfyImageParameters, validateComfyWorkflowSettings, } from './comfyui-image.js';
+export const IMAGE_PROVIDERS = ['novelai', 'openai', 'gemini', 'grok', 'comfy'];
+/** Providers that send one natural-language prompt: no negative field, no NAI columns. */
+export function isNaturalLanguageProvider(provider) { return provider !== 'novelai' && provider !== 'comfy'; }
+/** ComfyUI 和 NAI 一样接受独立负面提示词，只是不做角色分栏解析。 */
+export function supportsNegativePrompt(provider) { return provider === 'novelai' || provider === 'comfy'; }
+export function imageProviderName(provider) {
+    return { novelai: 'NAI', openai: 'GPT', gemini: 'Gemini', grok: 'Grok', comfy: 'ComfyUI' }[provider];
+}
+import { defaultImageParameters, NAI_MODELS, NAI_SAMPLERS, NAI_SCHEDULES, } from './novelai.js';
+const storageKey = 'witch-paintbox:image-settings:v1';
+export function defaultImageSettings(provider = 'novelai') {
+    return {
+        provider, openaiParameters: defaultOpenAIImageParameters(), models: [],
+        geminiParameters: defaultGeminiImageParameters(), grokParameters: defaultGrokImageParameters(),
+        comfyParameters: defaultComfyImageParameters(), comfyWorkflow: defaultComfyWorkflowSettings(),
+        // ComfyUI 没有「官方」渠道，默认就是指向本机的一段自定义地址。
+        connection: provider === 'comfy'
+            ? { channel: 'custom', url: COMFY_DEFAULT_URL, key: '', appendSuffix: false }
+            : { channel: 'official', url: '', key: '', appendSuffix: true },
+        connectionProfiles: [],
+        activeConnectionId: '',
+        parameters: defaultImageParameters(),
+        positive: '',
+        negative: '',
+        artists: [],
+        activeArtistId: '',
+    };
+}
+function invalid() {
+    throw withFault(new Error('生图配置格式无效，请检查参数和配置条目。'), 'setup');
+}
+function record(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        invalid();
+    return value;
+}
+function text(value, maxLength = 65_536, required = false) {
+    if (typeof value !== 'string' || value.length > maxLength || (required && !value.trim()))
+        invalid();
+    return value;
+}
+function number(value, min, max, integer = false) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max)
+        invalid();
+    if (integer && !Number.isInteger(value))
+        invalid();
+    return value;
+}
+function boolean(value) {
+    if (typeof value !== 'boolean')
+        invalid();
+    return value;
+}
+function option(value, options) {
+    const selected = text(value, 128, true);
+    if (!options.some(item => item.value === selected))
+        invalid();
+    return selected;
+}
+function connection(value, provider) {
+    const source = record(value);
+    if (source.channel !== 'official' && source.channel !== 'custom')
+        invalid();
+    const url = text(source.url, 8192);
+    let appendSuffix = source.appendSuffix === undefined ? true : boolean(source.appendSuffix);
+    // Older NAI connections only expanded a bare origin; keep custom paths intact.
+    if (source.appendSuffix === undefined && provider === 'novelai' && source.channel === 'custom' && url.trim()) {
+        try {
+            appendSuffix = new URL(url.trim()).pathname === '/';
+        }
+        catch {
+            appendSuffix = false;
+        }
+    }
+    // ComfyUI 没有官方渠道；旧配置里残留的 official 一律按自定义处理，且不做后缀拼接。
+    if (provider === 'comfy')
+        return { channel: 'custom', url, key: text(source.key, 16_384), appendSuffix };
+    return { channel: source.channel, url, key: text(source.key, 16_384), appendSuffix };
+}
+function parameters(value) {
+    const source = record(value);
+    const width = number(source.width, 64, 4096, true);
+    const height = number(source.height, 64, 4096, true);
+    if (width % 64 || height % 64)
+        invalid();
+    return {
+        model: option(source.model, NAI_MODELS),
+        width,
+        height,
+        steps: number(source.steps, 1, 50, true),
+        scale: number(source.scale, 0, 100),
+        sampler: option(source.sampler, NAI_SAMPLERS),
+        seed: number(source.seed, -1, 4_294_967_295, true),
+        noiseSchedule: option(source.noiseSchedule, NAI_SCHEDULES),
+        cfgRescale: number(source.cfgRescale, 0, 1),
+        sm: boolean(source.sm),
+        smDyn: boolean(source.smDyn),
+    };
+}
+function profiles(value, parse) {
+    if (!Array.isArray(value) || value.length > 200)
+        invalid();
+    const items = value.map(parse);
+    if (new Set(items.map(item => item.id)).size !== items.length)
+        invalid();
+    return items;
+}
+function selectedId(value, items) {
+    const id = text(value, 128);
+    if (id && !items.some(item => item.id === id))
+        invalid();
+    return id;
+}
+export function validateImageSettings(value) {
+    const source = record(value);
+    const provider = (source.provider ?? 'novelai');
+    if (!IMAGE_PROVIDERS.includes(provider))
+        invalid();
+    const models = source.models ?? [];
+    if (!Array.isArray(models) || models.length > 10_000)
+        invalid();
+    const modelNames = models.map(value => text(value, 512, true));
+    if (new Set(modelNames).size !== modelNames.length)
+        invalid();
+    const connectionProfiles = profiles(source.connectionProfiles, value => {
+        const item = record(value);
+        return { ...connection(item, provider), id: text(item.id, 128, true), name: text(item.name, 128, true) };
+    });
+    const artists = profiles(source.artists, value => {
+        const item = record(value);
+        return {
+            id: text(item.id, 128, true),
+            name: text(item.name, 128, true),
+            positive: text(item.positive),
+            negative: text(item.negative),
+        };
+    });
+    if (isNaturalLanguageProvider(provider) && (text(source.negative).trim() || artists.some(item => item.negative.trim()))) {
+        const name = imageProviderName(provider);
+        throw new Error(`${name} 配置不支持独立负面提示词，请先在来源配置中移除负面字段内容，再导入 ${name} 配置。`);
+    }
+    return {
+        provider, models: modelNames,
+        openaiParameters: validateOpenAIImageParameters(source.openaiParameters ?? defaultOpenAIImageParameters()),
+        geminiParameters: validateGeminiImageParameters(source.geminiParameters ?? defaultGeminiImageParameters(), invalid),
+        grokParameters: validateGrokImageParameters(source.grokParameters ?? defaultGrokImageParameters(), invalid),
+        comfyParameters: validateComfyImageParameters(source.comfyParameters ?? defaultComfyImageParameters(), invalid),
+        comfyWorkflow: validateComfyWorkflowSettings(source.comfyWorkflow ?? defaultComfyWorkflowSettings(), invalid),
+        connection: connection(source.connection, provider),
+        connectionProfiles,
+        activeConnectionId: selectedId(source.activeConnectionId, connectionProfiles),
+        parameters: parameters(source.parameters),
+        positive: text(source.positive),
+        negative: text(source.negative),
+        artists,
+        activeArtistId: selectedId(source.activeArtistId, artists),
+    };
+}
+function sameConnection(left, right) {
+    return left.channel === right.channel && left.url === right.url && left.appendSuffix === right.appendSuffix;
+}
+export function defaultAllImageSettings() {
+    return { version: 2, activeProvider: 'novelai', profiles: {
+            novelai: defaultImageSettings('novelai'), openai: defaultImageSettings('openai'),
+            gemini: defaultImageSettings('gemini'), grok: defaultImageSettings('grok'), comfy: defaultImageSettings('comfy'),
+        } };
+}
+/** 新增画笔时，缺省的那几路直接补默认值，不要求用户重导配置。 */
+const FILLABLE_PROVIDERS = ['gemini', 'grok', 'comfy'];
+export function validateAllImageSettings(value) {
+    const source = record(value);
+    if (source.version === undefined) {
+        const legacy = validateImageSettings(source);
+        const all = defaultAllImageSettings();
+        all.profiles[legacy.provider] = legacy;
+        all.activeProvider = legacy.provider;
+        return all;
+    }
+    if (source.version !== 2 || !IMAGE_PROVIDERS.includes(source.activeProvider))
+        invalid();
+    const profiles = record(source.profiles);
+    // 旧版文件只带当时存在的通道；缺的通道用默认值补齐。
+    const parsed = {};
+    for (const provider of IMAGE_PROVIDERS) {
+        const raw = profiles[provider];
+        if (raw === undefined && FILLABLE_PROVIDERS.includes(provider)) {
+            parsed[provider] = defaultImageSettings(provider);
+            continue;
+        }
+        parsed[provider] = validateImageSettings(raw);
+        if (parsed[provider].provider !== provider)
+            invalid();
+    }
+    return { version: 2, activeProvider: source.activeProvider, profiles: parsed };
+}
+const settingsStorage = createSettingsStorage({
+    localKey: storageKey, hostKey: 'image-settings-v1', label: '生图配置',
+    defaults: defaultAllImageSettings, validate: validateAllImageSettings,
+    stripKeys(value) {
+        for (const settings of Object.values(value.profiles)) {
+            settings.connection.key = '';
+            settings.connectionProfiles.forEach(profile => { profile.key = ''; });
+        }
+        return value;
+    },
+    restoreKeys(value, local) {
+        for (const provider of IMAGE_PROVIDERS) {
+            const settings = value.profiles[provider], savedSettings = local.profiles[provider];
+            const active = savedSettings.connectionProfiles.find(item => item.id === settings.activeConnectionId && sameConnection(item, settings.connection));
+            settings.connection.key = active?.key ?? (settings.activeConnectionId === savedSettings.activeConnectionId
+                && sameConnection(settings.connection, savedSettings.connection) ? savedSettings.connection.key : '');
+            for (const profile of settings.connectionProfiles) {
+                const saved = savedSettings.connectionProfiles.find(item => item.id === profile.id && sameConnection(item, profile));
+                profile.key = saved?.key ?? '';
+            }
+        }
+        return value;
+    },
+    changed() { window.dispatchEvent(new Event('witch-paintbox:image-settings-changed')); },
+});
+export function loadAllImageSettings() { return settingsStorage.load(); }
+export function loadImageSettings(provider) {
+    const all = settingsStorage.load();
+    return all.profiles[provider ?? all.activeProvider];
+}
+export function saveImageSettings(settings) {
+    const snapshot = validateImageSettings(settings);
+    return settingsStorage.update(all => ({ ...all, profiles: { ...all.profiles, [snapshot.provider]: snapshot } }));
+}
+export async function switchImageProvider(provider) {
+    if (!IMAGE_PROVIDERS.includes(provider))
+        invalid();
+    if (settingsStorage.load().activeProvider === provider)
+        return;
+    await settingsStorage.update(all => ({ ...all, activeProvider: provider }));
+    window.dispatchEvent(new Event('witch-paintbox:image-provider-changed'));
+}
+/** Bulk import refreshes the UI only after every section commits or rolls back. */
+export function saveAllImageSettings(settings) {
+    return settingsStorage.save(settings);
+}

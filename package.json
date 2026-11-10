@@ -1,0 +1,13 @@
+{
+  "name": "witch-paintbox-comfyui",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --experimental-vm-modules tests/image-workflow.test.mjs && node tests/openai-image-26.test.mjs && node tests/comfyui-workflow.test.mjs && node tests/comfyui-generate.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3"
+  }
+}

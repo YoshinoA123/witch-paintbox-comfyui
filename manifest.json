@@ -1,0 +1,9 @@
+{
+  "display_name": "魔女画匣 · ComfyUI",
+  "author": "Elainadesne（ComfyUI 扩展版）",
+  "version": "0.2.0",
+  "js": "dist/index.js",
+  "loading_order": 100,
+  "requires": [],
+  "optional": []
+}
