@@ -1,6 +1,10 @@
 # 统一按 LF 存储，避免 Windows 与 Linux（酒馆常在 Linux 上跑）之间换行符来回变动
 * text=auto eol=lf
 
+# Windows 批处理必须保持 CRLF，否则 cmd 无法正常执行
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 # 二进制资源不做换行符转换
 *.webp binary
 *.png binary
